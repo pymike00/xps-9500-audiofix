@@ -1,0 +1,77 @@
+# Dell XPS 15 9500 speaker tuning. @PHYSICAL_JSON@ is filled by install.py.
+# The two stereo channels feed both the tweeters and the lower woofers.
+context.modules = [
+    {
+        name = libpipewire-module-filter-chain
+        args = {
+            node.description = "XPS 15 Speakers (Tuned)"
+            media.name = "XPS 15 Speakers (Tuned)"
+            filter.graph = {
+                nodes = [
+                    {
+                        type = builtin
+                        name = protect
+                        label = bq_highpass
+                        control = { "Freq" = 75.0 "Q" = 0.707 "Gain" = 0.0 }
+                    }
+                    {
+                        type = builtin
+                        name = bass
+                        label = bq_peaking
+                        control = { "Freq" = 190.0 "Q" = 0.75 "Gain" = 3.3 }
+                    }
+                    {
+                        type = builtin
+                        name = warmth
+                        label = bq_peaking
+                        control = { "Freq" = 120.0 "Q" = 0.9 "Gain" = 2.0 }
+                    }
+                    {
+                        type = builtin
+                        name = low_mids
+                        label = bq_peaking
+                        control = { "Freq" = 430.0 "Q" = 0.9 "Gain" = 0.0 }
+                    }
+                    {
+                        type = builtin
+                        name = presence
+                        label = bq_peaking
+                        control = { "Freq" = 2400.0 "Q" = 0.9 "Gain" = 0.0 }
+                    }
+                    {
+                        type = builtin
+                        name = treble
+                        label = bq_highshelf
+                        control = { "Freq" = 5200.0 "Q" = 0.707 "Gain" = -0.5 }
+                    }
+                    {
+                        type = builtin
+                        name = headroom
+                        label = linear
+                        control = { "Mult" = 0.60 "Add" = 0.0 }
+                    }
+                ]
+                links = [
+                    { output = "protect:Out" input = "bass:In" }
+                    { output = "bass:Out" input = "warmth:In" }
+                    { output = "warmth:Out" input = "low_mids:In" }
+                    { output = "low_mids:Out" input = "presence:In" }
+                    { output = "presence:Out" input = "treble:In" }
+                    { output = "treble:Out" input = "headroom:In" }
+                ]
+            }
+            audio.channels = 2
+            audio.position = [ FL FR ]
+            capture.props = {
+                node.name = "xps_15_speakers_tuned"
+                node.description = "XPS 15 Speakers (Tuned)"
+                media.class = Audio/Sink
+            }
+            playback.props = {
+                node.name = "xps_15_speakers_tuned_output"
+                node.passive = true
+                target.object = @PHYSICAL_JSON@
+            }
+        }
+    }
+]

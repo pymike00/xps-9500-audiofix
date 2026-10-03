@@ -1,0 +1,14 @@
+[Unit]
+Description=Dell XPS 15 speaker equalizer
+After=pipewire.service wireplumber.service
+Requires=pipewire.service
+PartOf=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/pipewire -c filter-chain.conf
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

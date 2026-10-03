@@ -1,0 +1,14 @@
+[Unit]
+Description=Use Dell XPS speaker tuning only on built-in speakers
+After=xps-speaker-eq.service wireplumber.service
+Requires=xps-speaker-eq.service
+PartOf=xps-speaker-eq.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/lib/xps-9500-audiofix/route.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
