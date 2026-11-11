@@ -28,7 +28,7 @@ python3 install.py install --dry-run
 python3 install.py install
 ```
 
-If you already have files at the install locations, the installer stops and lists them. Review those files, then run `python3 install.py install --replace-existing` to back them up and replace them. The option is useful if you previously applied this project's manual configuration. The install script sets the physical speaker level to 90%; use the normal desktop volume control for day-to-day listening and lower it if a track buzzes.
+If you already have files at the install locations, the installer stops and lists them. Review those files, then run `python3 install.py install --replace-existing` to back them up and replace them. The option also handles this project's older manual configuration: it backs up the shared `filter-chain.conf.d/xps-15-speakers.conf`, replaces it with a comment, and restarts the shared filter service if active. If you already installed using `install.py`, use the migration command below instead. The install script sets the physical speaker level to 90%; use the normal desktop volume control for day-to-day listening and lower it if a track buzzes.
 
 Select **XPS 15 Speakers (Tuned)** in Sound settings if it is not selected automatically. Leave the card profile at **Analog Stereo**. The headphone jack uses the plain Built-in Audio Analog Stereo output when its port becomes active; choosing Bluetooth or HDMI manually is respected.
 
@@ -40,6 +40,20 @@ wpctl status
 ```
 
 You should see both `xps-speaker-*.service` units active and `xps_15_speakers_tuned` as the configured default while the built-in speaker port is active.
+
+## Upgrade an existing installation
+
+After updating this repository, run these commands as your normal desktop user:
+
+```sh
+python3 install.py migrate --dry-run
+python3 install.py migrate
+wpctl status
+```
+
+The migration moves older installations from the shared filter configuration to the private XPS configuration, preventing duplicate tuned outputs. It briefly restarts the audio filters, preserves the tuned output's volume and mute state, and respects a selected external output. Check that `wpctl status` shows exactly one `xps_15_speakers_tuned` sink and try the volume buttons while audio plays. The separate `xps_15_speakers_tuned_output` playback stream is expected.
+
+The command saves the previous files under `.local/state/xps-9500-audiofix/migration-*/`, retains the original uninstall backups, and restores the previous setup if migration fails. It refuses edited managed files or an unrecorded private configuration; review and save those changes before migrating. Running it again after a successful migration makes no changes. For an older manual setup without an installation record, use `install --dry-run`, then `install --replace-existing` after reviewing the reported files.
 
 ## Uninstall
 
@@ -53,13 +67,13 @@ This stops and disables the two user services, restores any files it replaced, a
 
 | Path under your home directory | Purpose |
 | --- | --- |
-| `.config/pipewire/filter-chain.conf.d/xps-15-speakers.conf` | PipeWire speaker filter graph. |
+| `.config/pipewire/xps-15-speakers.conf` | Private PipeWire speaker filter configuration. |
 | `.local/lib/xps-9500-audiofix/route.py` and `device.json` | Detect the active speaker/headphone port and choose the matching output. |
 | `.config/systemd/user/xps-speaker-eq.service` | Start the filter at login. |
 | `.config/systemd/user/xps-speaker-route.service` | Start the route watcher at login. |
 | `.local/state/xps-9500-audiofix/` | Installation record and backups for uninstall. |
 
-The EQ uses PipeWire's [built-in filter-chain module](https://pipewire.pages.freedesktop.org/pipewire/page_module_filter_chain.html). The route watcher checks the active PipeWire card route every two seconds. It changes the default only when the current default is one of this laptop's two internal outputs, so an explicitly selected external output stays selected.
+The EQ uses PipeWire's [built-in filter-chain module](https://pipewire.pages.freedesktop.org/pipewire/page_module_filter_chain.html). Its service loads a private configuration so the distribution's `filter-chain.service` cannot create a duplicate tuned output. The route watcher checks the active PipeWire card route every two seconds. It changes the default only when the current default is one of this laptop's two internal outputs, so an explicitly selected external output stays selected.
 
 ## Troubleshooting
 
@@ -67,6 +81,7 @@ The EQ uses PipeWire's [built-in filter-chain module](https://pipewire.pages.fre
 - **No tuned output appears:** run `systemctl --user status xps-speaker-eq.service` and `journalctl --user -u xps-speaker-eq.service -n 30 --no-pager`.
 - **Headphones keep the speaker EQ:** run `python3 install.py status` and `journalctl --user -u xps-speaker-route.service -n 30 --no-pager`. The headphone-switching logic was verified against the speaker route on the development laptop; a physical headphone insertion test was not available for this release.
 - **Buzzing or harsh sound:** lower the normal speaker volume. This is a moderate EQ, and individual speaker units or tracks may still distort.
+- **Volume indicator moves but loudness does not:** check `wpctl status` for duplicate `xps_15_speakers_tuned` sinks. Older versions loaded the shared `filter-chain.conf`, which could start the same filter from both the distribution's service and this project's service. Run `python3 install.py migrate --dry-run`, then `python3 install.py migrate` as described above.
 - **You want to edit the EQ:** edit the installed `xps-15-speakers.conf`, then run `systemctl --user restart xps-speaker-eq.service`. Uninstall will require `--force` after an edit, so keep a copy of your changes first.
 
 ## License

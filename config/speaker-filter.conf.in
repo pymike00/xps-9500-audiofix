@@ -1,6 +1,17 @@
 # Dell XPS 15 9500 speaker tuning. @PHYSICAL_JSON@ is filled by install.py.
 # The two stereo channels feed both the tweeters and the lower woofers.
+# Keep this configuration private to xps-speaker-eq.service. Loading the same
+# fragment from the stock filter-chain.service would create a second sink.
+context.spa-libs = {
+    audio.convert.* = audioconvert/libspa-audioconvert
+    support.* = support/libspa-support
+}
+
 context.modules = [
+    { name = libpipewire-module-rt flags = [ ifexists nofail ] }
+    { name = libpipewire-module-protocol-native }
+    { name = libpipewire-module-client-node }
+    { name = libpipewire-module-adapter }
     {
         name = libpipewire-module-filter-chain
         args = {

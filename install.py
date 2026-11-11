@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install or remove the XPS 15 9500 speaker tuning without root access."""
+"""Install, migrate, or remove the XPS 15 9500 speaker tuning without root access."""
 
 import argparse
 import hashlib
@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -18,7 +19,11 @@ HOME = Path.home()
 STATE_DIR = HOME / ".local/state/xps-9500-audiofix"
 STATE_FILE = STATE_DIR / "install.json"
 LIB_DIR = HOME / ".local/lib/xps-9500-audiofix"
-FILTER_FILE = HOME / ".config/pipewire/filter-chain.conf.d/xps-15-speakers.conf"
+FILTER_FILE = HOME / ".config/pipewire/xps-15-speakers.conf"
+LEGACY_FILTER_FILE = HOME / ".config/pipewire/filter-chain.conf.d/xps-15-speakers.conf"
+LEGACY_PLACEHOLDER = (
+    b"# XPS speaker EQ moved to ../xps-15-speakers.conf to avoid duplicate sinks.\n"
+)
 EQ_UNIT = HOME / ".config/systemd/user/xps-speaker-eq.service"
 ROUTE_UNIT = HOME / ".config/systemd/user/xps-speaker-route.service"
 UNITS = ("xps-speaker-eq.service", "xps-speaker-route.service")
@@ -164,7 +169,7 @@ def restore_switch(card_number, control, switches):
         call("amixer", "-c", str(card_number), "sset", control, "off", capture=True)
 
 
-def service_state():
+def service_state(units=UNITS):
     return {
         unit: {
             "active": call("systemctl", "--user", "is-active", unit, capture=True, check=False).strip()
@@ -172,7 +177,7 @@ def service_state():
             "enabled": call("systemctl", "--user", "is-enabled", unit, capture=True, check=False).strip()
             == "enabled",
         }
-        for unit in UNITS
+        for unit in units
     }
 
 
@@ -191,11 +196,167 @@ def target_files(card):
         EQ_UNIT: (ROOT / "systemd/xps-speaker-eq.service").read_bytes(),
         ROUTE_UNIT: (ROOT / "systemd/xps-speaker-route.service").read_bytes(),
     }
+    if LEGACY_FILTER_FILE.exists() or LEGACY_FILTER_FILE.is_symlink():
+        files[LEGACY_FILTER_FILE] = LEGACY_PLACEHOLDER
     return files, physical
 
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def shared_filter_active(files):
+    if LEGACY_FILTER_FILE not in files:
+        return False
+    return service_state(("filter-chain.service",))["filter-chain.service"]["active"]
+
+
+def migration_files(state):
+    """Validate managed files before planning the change to a private config."""
+    entries = {entry["target"]: entry for entry in state["files"]}
+
+    def validate(path):
+        entry = entries.get(str(path))
+        if entry is None:
+            raise InstallError(
+                f"No installation record for {path}; inspect it before migrating."
+            )
+        if path.is_symlink() or not path.is_file() or digest(path.read_bytes()) != entry["sha256"]:
+            raise InstallError(
+                f"Installed file was edited or is missing: {path}; inspect it before migrating."
+            )
+
+    validate(EQ_UNIT)
+    if str(FILTER_FILE) in entries:
+        validate(FILTER_FILE)
+        if LEGACY_FILTER_FILE.exists() or LEGACY_FILTER_FILE.is_symlink():
+            validate(LEGACY_FILTER_FILE)
+            if LEGACY_FILTER_FILE.read_bytes() != LEGACY_PLACEHOLDER:
+                raise InstallError(
+                    f"Shared XPS filter is still present: {LEGACY_FILTER_FILE}; "
+                    "inspect it before migrating."
+                )
+        return {}
+
+    validate(LEGACY_FILTER_FILE)
+    if FILTER_FILE.exists() or FILTER_FILE.is_symlink():
+        raise InstallError(f"Refusing to overwrite an unrecorded configuration: {FILTER_FILE}")
+    files, physical = target_files({"info": {"props": {"device.name": state["card_name"]}}})
+    if physical != state["physical_name"]:
+        raise InstallError("The recorded card and physical output do not match.")
+    return {path: files[path] for path in (LEGACY_FILTER_FILE, FILTER_FILE, EQ_UNIT)}
+
+
+def migrate(dry_run=False):
+    if os.geteuid() == 0:
+        raise InstallError("Run this as your normal desktop user, without sudo.")
+    if not STATE_FILE.exists():
+        raise InstallError(
+            "No installation record found. For a manual setup, use 'install --replace-existing'."
+        )
+    original_state = STATE_FILE.read_bytes()
+    state = json.loads(original_state)
+    files = migration_files(state)
+    if not files:
+        print("Already using the private speaker configuration; no changes needed.")
+        return
+    if dry_run:
+        print("Would migrate the shared speaker filter to:", FILTER_FILE)
+        print("Would restart the XPS services and the shared filter service if active.")
+        print("Dry run: no files or audio settings changed.")
+        return
+
+    # Resolve the desktop's selected sink, since duplicate names are ambiguous.
+    current_default = default_name()
+    items = objects()
+    tuned = find_node(items, TUNED)
+    target = str(tuned["id"]) if tuned else None
+    if current_default == TUNED:
+        target = "@DEFAULT_AUDIO_SINK@"
+    saved_volume = None
+    if target:
+        result = call("wpctl", "get-volume", target, capture=True)
+        match = re.search(r"Volume:\s*([0-9.]+)", result)
+        if not match:
+            raise InstallError("Could not read the tuned output volume; no files changed.")
+        saved_volume = (match.group(1), "[MUTED]" in result)
+    services = service_state((*UNITS, "filter-chain.service"))
+
+    backup = Path(tempfile.mkdtemp(prefix="migration-", dir=STATE_DIR))
+    originals = {}
+    for index, path in enumerate(files):
+        original = backup / str(index) if path.exists() else None
+        if original:
+            shutil.copy2(path, original)
+        originals[path] = original
+    (backup / "install.json").write_bytes(original_state)
+    (backup / "files.json").write_text(
+        json.dumps({str(p): b.name if b else None for p, b in originals.items()}, indent=2) + "\n"
+    )
+
+    def restore_selection():
+        if saved_volume:
+            node = wait_for_node(TUNED)
+            call("wpctl", "set-volume", str(node["id"]), saved_volume[0])
+            call("wpctl", "set-mute", str(node["id"]), "1" if saved_volume[1] else "0")
+        if current_default:
+            node = find_node(objects(), current_default)
+            if node:
+                call("wpctl", "set-default", str(node["id"]))
+
+    try:
+        call("systemctl", "--user", "stop", UNITS[1], UNITS[0])
+        for path, data in files.items():
+            path.write_bytes(data)
+            path.chmod(0o644)
+        call("systemctl", "--user", "daemon-reload")
+        if services["filter-chain.service"]["active"]:
+            call("systemctl", "--user", "restart", "filter-chain.service")
+        call("systemctl", "--user", "start", UNITS[0])
+        wait_for_node(TUNED)
+        nodes = [obj for obj in objects() if props(obj).get("node.name") == TUNED]
+        if len(nodes) != 1:
+            raise InstallError(f"Expected one tuned output after migration, found {len(nodes)}.")
+        restore_selection()
+        call("systemctl", "--user", "start", UNITS[1])
+
+        # Retain every original uninstall backup, including the shared fragment.
+        entries = {entry["target"]: entry for entry in state["files"]}
+        for path, data in files.items():
+            entry = entries.get(str(path))
+            if entry is None:
+                entry = {"target": str(path), "backup": None}
+                state["files"].append(entry)
+            entry["sha256"] = digest(data)
+        temporary = backup / "updated-install.json"
+        temporary.write_text(json.dumps(state, indent=2) + "\n")
+        temporary.replace(STATE_FILE)
+    except BaseException as exc:
+        try:
+            call("systemctl", "--user", "stop", UNITS[1], UNITS[0], check=False)
+            for path, original in originals.items():
+                if original:
+                    shutil.copy2(original, path)
+                else:
+                    path.unlink(missing_ok=True)
+            STATE_FILE.write_bytes(original_state)
+            call("systemctl", "--user", "daemon-reload")
+            if services["filter-chain.service"]["active"]:
+                call("systemctl", "--user", "restart", "filter-chain.service")
+            for unit in UNITS:
+                if services[unit]["active"]:
+                    call("systemctl", "--user", "start", unit)
+            restore_selection()
+        except (OSError, InstallError, subprocess.SubprocessError) as rollback_error:
+            raise InstallError(
+                f"Migration failed: {exc}. Recovery also failed: {rollback_error}. "
+                f"Backups: {backup}"
+            ) from exc
+        raise InstallError(
+            f"Migration failed; previous files and services restored: {exc}. Backups: {backup}"
+        ) from exc
+    print("Migrated. Exactly one tuned speaker output is available.")
+    print("Previous files saved at:", backup)
 
 
 def restore_files(state):
@@ -260,7 +421,7 @@ def install(replace_existing=False, dry_run=False):
         if shutil.which(command) is None:
             raise InstallError(f"Required command not found: {command}")
     if STATE_FILE.exists():
-        print("Already installed. Use 'status' or 'uninstall' first.")
+        print("Already installed. Use 'migrate' for older installations, 'status', or 'uninstall'.")
         return
     if STATE_DIR.exists():
         raise InstallError(f"Incomplete installation state at {STATE_DIR}; inspect it before retrying.")
@@ -284,6 +445,7 @@ def install(replace_existing=False, dry_run=False):
         print("Dry run: no files or audio settings changed.")
         return
 
+    shared_active = shared_filter_active(files)
     old_default = default_name()
     old_profile = profile_name(card)
     old_volume = volume(find_node(items, physical))
@@ -325,6 +487,8 @@ def install(replace_existing=False, dry_run=False):
         call("wpctl", "set-volume", str(sink["id"]), "0.90")
 
         call("systemctl", "--user", "daemon-reload")
+        if shared_active:
+            call("systemctl", "--user", "restart", "filter-chain.service")
         call("systemctl", "--user", "enable", "--now", *UNITS)
         tuned = wait_for_node(TUNED)
         if old_default in (physical, TUNED, None):
@@ -333,6 +497,8 @@ def install(replace_existing=False, dry_run=False):
     except Exception:
         call("systemctl", "--user", "disable", "--now", *UNITS, check=False)
         restore_files(state)
+        if shared_active:
+            call("systemctl", "--user", "restart", "filter-chain.service")
         restore_services(state)
         restore_audio(state)
         shutil.rmtree(STATE_DIR)
@@ -359,11 +525,14 @@ def uninstall(force=False):
         )
 
     physical = state["physical_name"]
+    shared_active = shared_filter_active({Path(entry["target"]) for entry in state["files"]})
     sink = find_node(objects(), physical)
     if sink and default_name() == TUNED:
         call("wpctl", "set-default", str(sink["id"]))
     call("systemctl", "--user", "disable", "--now", *UNITS)
     restore_files(state)
+    if shared_active:
+        call("systemctl", "--user", "restart", "filter-chain.service")
     restore_services(state)
     restore_audio(state)
     shutil.rmtree(STATE_DIR)
@@ -388,6 +557,8 @@ def main():
     install_parser = sub.add_parser("install", help="Install the speaker tuning")
     install_parser.add_argument("--replace-existing", action="store_true")
     install_parser.add_argument("--dry-run", action="store_true")
+    migrate_parser = sub.add_parser("migrate", help="Move an older installation to a private EQ configuration")
+    migrate_parser.add_argument("--dry-run", action="store_true")
     uninstall_parser = sub.add_parser("uninstall", help="Restore previous settings")
     uninstall_parser.add_argument("--force", action="store_true")
     sub.add_parser("status", help="Show service and output status")
@@ -395,6 +566,8 @@ def main():
     try:
         if args.command == "install":
             install(args.replace_existing, args.dry_run)
+        elif args.command == "migrate":
+            migrate(args.dry_run)
         elif args.command == "uninstall":
             uninstall(args.force)
         else:
